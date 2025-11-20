@@ -1,4 +1,3 @@
-
 """
 Testing Framework for Hidden Page Detection Plugin
 

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Memory Stress Test Script
 Creates various memory allocations that may appear as hidden pages
