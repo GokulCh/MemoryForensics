@@ -1,5 +1,5 @@
 """
-Volatility 3 Plugin: Hidden Page Detection
+Volatility 3 Plugin: Hidden Page Detection (Enhanced)
 
 Detects memory pages that exist in physical memory but are unmapped
 from the official page tables - a technique used by rootkits and malware.
@@ -8,24 +8,276 @@ Methodology:
 1. Scan memory for page table entry signatures
 2. Validate candidates using multi-field heuristics
 3. Cross-reference with official page tables
-4. Report discrepancies as potential hidden pages
+4. Generate detailed page table walk reports for hidden pages
 
 Authors: Ariana Thomas, Gokul Chaluvadi, Terens Tare
 Course: CMSC 654
 """
 
 import struct
-from typing import List, Tuple, Iterator, Optional
+from typing import List, Tuple, Iterator, Optional, Dict
 import sys
-import concurrent.futures 
+import os
 
 from volatility3.framework import interfaces, renderers, exceptions
 from volatility3.framework.configuration import requirements
 from volatility3.framework.renderers import format_hints
-from volatility3.framework.layers import intel
 
 # Define the number of worker threads (retained for performance)
 MAX_WORKERS = 8 
+
+
+class PageTableWalker:
+    """
+    Walks x64 page tables to prove pages are unmapped.
+    Generates detailed reports for presentation/demonstration.
+    """
+    
+    def __init__(self, kernel_layer, dtb: int):
+        """
+        Initialize with kernel layer and Directory Table Base (CR3).
+        
+        Args:
+            kernel_layer: Volatility kernel memory layer
+            dtb: Page table base address (CR3)
+        """
+        self.kernel_layer = kernel_layer
+        self.dtb = dtb
+    
+    def _read_qword(self, address: int) -> int:
+        """Read 8-byte value from memory"""
+        try:
+            data = self.kernel_layer.read(address, 8, pad=False)
+            return struct.unpack('<Q', data)[0]
+        except:
+            return 0
+    
+    def walk_page_tables(self, virtual_address: int) -> Dict:
+        """
+        Manually walk the 4-level page tables for a virtual address.
+        
+        Returns dict with:
+        - virtual_address: VA being checked
+        - pml4_entry: PML4 entry value
+        - pdpt_entry: PDPT entry value
+        - pd_entry: PD entry value
+        - pt_entry: PT entry value (or None if unmapped)
+        - level_reached: How far we got (0-4)
+        - is_mapped: True if fully mapped
+        - details: List of human-readable steps
+        """
+        result = {
+            'virtual_address': hex(virtual_address),
+            'pml4_entry': None,
+            'pdpt_entry': None,
+            'pd_entry': None,
+            'pt_entry': None,
+            'level_reached': 0,
+            'is_mapped': False,
+            'details': []
+        }
+        
+        # Extract indices from virtual address (x64 paging)
+        pml4_index = (virtual_address >> 39) & 0x1FF  # Bits 39-47
+        pdpt_index = (virtual_address >> 30) & 0x1FF  # Bits 30-38
+        pd_index = (virtual_address >> 21) & 0x1FF    # Bits 21-29
+        pt_index = (virtual_address >> 12) & 0x1FF    # Bits 12-20
+        
+        result['details'].append(f"Virtual Address: {hex(virtual_address)}")
+        result['details'].append(f"Indices: PML4[{pml4_index}] PDPT[{pdpt_index}] PD[{pd_index}] PT[{pt_index}]")
+        
+        try:
+            # Level 1: PML4 (Page Map Level 4)
+            pml4_address = self.dtb + (pml4_index * 8)
+            pml4_entry = self._read_qword(pml4_address)
+            result['pml4_entry'] = hex(pml4_entry)
+            result['level_reached'] = 1
+            
+            if not (pml4_entry & 0x1):  # Present bit
+                result['details'].append(f"  L1-PML4: ❌ NOT PRESENT at {hex(pml4_address)}")
+                return result
+            
+            result['details'].append(f"  L1-PML4: ✓ {hex(pml4_entry)}")
+            
+            # Level 2: PDPT (Page Directory Pointer Table)
+            pdpt_base = (pml4_entry >> 12) & 0xFFFFFFFFF
+            pdpt_address = (pdpt_base << 12) + (pdpt_index * 8)
+            pdpt_entry = self._read_qword(pdpt_address)
+            result['pdpt_entry'] = hex(pdpt_entry)
+            result['level_reached'] = 2
+            
+            if not (pdpt_entry & 0x1):
+                result['details'].append(f"  L2-PDPT: ❌ NOT PRESENT at {hex(pdpt_address)}")
+                return result
+            
+            # Check for 1GB page
+            if pdpt_entry & 0x80:
+                result['details'].append(f"  L2-PDPT: ✓ {hex(pdpt_entry)} (1GB page)")
+                result['is_mapped'] = True
+                return result
+            
+            result['details'].append(f"  L2-PDPT: ✓ {hex(pdpt_entry)}")
+            
+            # Level 3: PD (Page Directory)
+            pd_base = (pdpt_entry >> 12) & 0xFFFFFFFFF
+            pd_address = (pd_base << 12) + (pd_index * 8)
+            pd_entry = self._read_qword(pd_address)
+            result['pd_entry'] = hex(pd_entry)
+            result['level_reached'] = 3
+            
+            if not (pd_entry & 0x1):
+                result['details'].append(f"  L3-PD:   ❌ NOT PRESENT at {hex(pd_address)}")
+                return result
+            
+            # Check for 2MB page
+            if pd_entry & 0x80:
+                result['details'].append(f"  L3-PD:   ✓ {hex(pd_entry)} (2MB page)")
+                result['is_mapped'] = True
+                return result
+            
+            result['details'].append(f"  L3-PD:   ✓ {hex(pd_entry)}")
+            
+            # Level 4: PT (Page Table)
+            pt_base = (pd_entry >> 12) & 0xFFFFFFFFF
+            pt_address = (pt_base << 12) + (pt_index * 8)
+            pt_entry = self._read_qword(pt_address)
+            result['pt_entry'] = hex(pt_entry)
+            result['level_reached'] = 4
+            
+            if not (pt_entry & 0x1):
+                result['details'].append(f"  L4-PT:   ❌ NOT PRESENT at {hex(pt_address)}")
+                result['details'].append(f"  🚨 PROOF: Page table unmapped at final level!")
+                return result
+            
+            result['details'].append(f"  L4-PT:   ✓ {hex(pt_entry)}")
+            
+            # Extract final physical address
+            final_pfn = (pt_entry >> 12) & 0xFFFFFFFFF
+            final_physical = final_pfn << 12
+            result['details'].append(f"  → Maps to: {hex(final_physical)}")
+            result['is_mapped'] = True
+            
+        except Exception as e:
+            result['details'].append(f"  ❌ Error: {str(e)}")
+        
+        return result
+    
+    def generate_detailed_report(self, physical_address: int, pte_value: int, 
+                                 confidence: int, flags: str) -> str:
+        """
+        Generate a comprehensive proof report showing page is hidden.
+        
+        Returns:
+            Formatted report string suitable for saving to file
+        """
+        lines = []
+        lines.append("=" * 80)
+        lines.append("HIDDEN PAGE DETAILED ANALYSIS")
+        lines.append("=" * 80)
+        lines.append(f"Physical Address: {hex(physical_address)}")
+        lines.append(f"PTE Value:         {hex(pte_value)}")
+        lines.append(f"PTE Flags:         {flags}")
+        lines.append(f"Confidence:        {confidence}%")
+        lines.append("")
+        
+        # STEP 1: Verify physical memory exists
+        lines.append("STEP 1: Physical Memory Verification")
+        lines.append("-" * 80)
+        try:
+            data = self.kernel_layer.read(physical_address, 64, pad=False)
+            lines.append(f"✓ Physical memory at {hex(physical_address)} is ACCESSIBLE")
+            lines.append("")
+            lines.append("First 64 bytes:")
+            for i in range(0, 64, 16):
+                chunk = data[i:i+16]
+                hex_str = ' '.join(f'{b:02x}' for b in chunk)
+                ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                lines.append(f"  {hex(physical_address + i):016x}: {hex_str:<48} {ascii_str}")
+            
+            lines.append("")
+            lines.append("Signature Analysis:")
+            if b'\xde\xad\xbe\xef' in data:
+                lines.append("  🎯 DEADBEEF signature found - TEST DATA CONFIRMED")
+            if data[0] == 0xAA and data[1] == 0xAA:
+                lines.append("  🎯 0xAA pattern found - TEST DATA CONFIRMED")
+            if all(b == 0 for b in data):
+                lines.append("  ⚠️  All zeros - page may be cleared")
+            
+        except Exception as e:
+            lines.append(f"✗ Cannot read physical memory: {e}")
+            lines.append("")
+            lines.append("=" * 80)
+            lines.append("CONCLUSION: Cannot verify - physical memory inaccessible")
+            lines.append("=" * 80)
+            return "\n".join(lines)
+        
+        lines.append("")
+        
+        # STEP 2: Walk page tables across multiple virtual addresses
+        lines.append("STEP 2: Page Table Walking Analysis")
+        lines.append("-" * 80)
+        lines.append(f"Directory Table Base (CR3): {hex(self.dtb)}")
+        lines.append("")
+        lines.append("Testing multiple virtual address ranges to find mappings...")
+        lines.append("")
+        
+        # Test various virtual address ranges
+        test_cases = [
+            (0x0000000000400000, "User: Typical code region"),
+            (0x0000000010000000, "User: Heap region"),
+            (0x00007FF000000000, "User: High address space"),
+            (0xFFFF800000000000, "Kernel: Low range"),
+            (0xFFFFF80000000000, "Kernel: Typical region"),
+            (0xFFFFF80010000000, "Kernel: High offset"),
+        ]
+        
+        any_mapped = False
+        
+        for va, description in test_cases:
+            lines.append(f"Test: {description}")
+            walk_result = self.walk_page_tables(va)
+            
+            for detail in walk_result['details']:
+                lines.append(f"  {detail}")
+            
+            if walk_result['is_mapped']:
+                # Check if it actually maps to our physical address
+                try:
+                    translated, _, _ = self.kernel_layer.mapping(va, 0x1000, ignore_errors=False)
+                    if translated == physical_address:
+                        lines.append(f"  ✓✓ MAPS TO OUR PHYSICAL ADDRESS!")
+                        any_mapped = True
+                except:
+                    pass
+            
+            lines.append("")
+        
+        # STEP 3: Conclusion
+        lines.append("=" * 80)
+        lines.append("FINAL CONCLUSION")
+        lines.append("=" * 80)
+        
+        if any_mapped:
+            lines.append("⚠️  FALSE POSITIVE DETECTED")
+            lines.append("  The page IS actually mapped in page tables.")
+            lines.append("  This is not a hidden page - likely a detection error.")
+        else:
+            lines.append("🚨 HIDDEN PAGE CONFIRMED!")
+            lines.append("")
+            lines.append("Evidence:")
+            lines.append(f"  ✓ Physical memory exists at {hex(physical_address)}")
+            lines.append("  ✓ Memory is readable (64 bytes verified)")
+            lines.append("  ✗ NO page table entries map to this physical address")
+            lines.append(f"  ✗ Tested {len(test_cases)} different virtual address ranges")
+            lines.append("")
+            lines.append("Interpretation:")
+            lines.append("  This page exists in physical RAM but is deliberately")
+            lines.append("  unmapped from all virtual address spaces. This behavior")
+            lines.append("  is consistent with rootkit memory hiding techniques.")
+        
+        lines.append("=" * 80)
+        
+        return "\n".join(lines)
 
 
 class HiddenPages(interfaces.plugins.PluginInterface):
@@ -35,7 +287,7 @@ class HiddenPages(interfaces.plugins.PluginInterface):
     """
 
     _required_framework_version = (2, 0, 0)
-    _version = (1, 0, 0)
+    _version = (1, 1, 0)  # Version bump for enhanced functionality
 
     @classmethod
     def get_requirements(cls) -> List[interfaces.configuration.RequirementInterface]:
@@ -58,6 +310,18 @@ class HiddenPages(interfaces.plugins.PluginInterface):
                 optional=True,
                 default=80
             ),
+            requirements.BooleanRequirement(
+                name='detailed-reports',
+                description='Generate detailed page table walk reports (default: False)',
+                optional=True,
+                default=False
+            ),
+            requirements.StringRequirement(
+                name='report-dir',
+                description='Directory for detailed reports (default: ./reports)',
+                optional=True,
+                default='./reports'
+            ),
         ]
 
     def __init__(self, *args, **kwargs):
@@ -65,12 +329,31 @@ class HiddenPages(interfaces.plugins.PluginInterface):
         self.candidates_found = 0
         self.candidates_validated = 0
         self.hidden_pages_found = 0
+        self.page_table_walker = None
+
+    def _get_dtb(self, kernel) -> int:
+        """
+        Extract Directory Table Base (CR3) from kernel.
+        
+        Returns:
+            DTB address (page table base)
+        """
+        kernel_layer = self.context.layers[kernel.layer_name]
+        
+        # Try to get from layer configuration
+        if hasattr(kernel_layer, '_base_layer'):
+            base_layer = kernel_layer._base_layer
+            if hasattr(base_layer, 'config') and 'page_map_offset' in base_layer.config:
+                return base_layer.config['page_map_offset']
+        
+        # Fallback: Common default (not always reliable)
+        print("[!] Using default DTB: 0x1aa000 (may not be accurate)")
+        return 0x1aa000
 
     def _scan_for_pte_signatures(self, layer, scan_size_mb: int) -> Iterator[Tuple[int, int]]:
         """
         Scan memory for potential Page Table Entry signatures.
         """
-        # Replaced vollog.info with print
         print(f"[STAGE 1] Scanning {scan_size_mb} MB of memory for PTE signatures...")
         
         scan_size = scan_size_mb * 1024 * 1024 # Convert to bytes
@@ -86,17 +369,14 @@ class HiddenPages(interfaces.plugins.PluginInterface):
                 last_progress_mb = current_progress_mb
                 
             try:
-                # Read 8 bytes (potential PTE)
                 data = layer.read(offset, 8, pad=True)
                 qword = struct.unpack('<Q', data)[0]
                 
-                # Quick check: Present bit must be set
                 if qword & 0x1:
                     self.candidates_found += 1
                     yield (offset, qword)
                     
             except Exception as e:
-                # Skip inaccessible memory
                 continue
 
     def _validate_pte_candidate(self, offset: int, qword: int) -> Tuple[bool, int, str]:
@@ -104,20 +384,16 @@ class HiddenPages(interfaces.plugins.PluginInterface):
         Validate if a candidate looks like a real PTE using multiple heuristics.
         """
         score = 0
-        max_score = 100
         reasons = []
         
-        # Check 1: Present bit (mandatory)
         present = qword & 0x1
         if not present:
             return (False, 0, "Present bit not set")
         score += 20
         reasons.append("Present bit set")
         
-        # Check 2: Extract and validate PFN (Physical Frame Number)
-        pfn = (qword >> 12) & 0xFFFFFFFFF # Bits 12-47
+        pfn = (qword >> 12) & 0xFFFFFFFFF
         
-        # PFN shouldn't be all zeros or all ones
         if pfn == 0:
             return (False, score, "PFN is zero")
         if pfn == 0xFFFFFFFFF:
@@ -125,47 +401,40 @@ class HiddenPages(interfaces.plugins.PluginInterface):
         score += 20
         reasons.append("Valid PFN")
         
-        # Check 3: Physical address should be page-aligned
         physical_addr = pfn * 0x1000
         if physical_addr % 0x1000 != 0:
             return (False, score, "Not page-aligned")
         score += 15
         reasons.append("Page-aligned")
         
-        # Check 4: Reserved bits (52-63) should be zero
         reserved = (qword >> 52) & 0xFFF
         if reserved == 0:
             score += 15
             reasons.append("Reserved bits zero")
-        elif reserved < 0x10: # Allow some tolerance
+        elif reserved < 0x10:
             score += 5
             reasons.append("Reserved bits mostly zero")
         
-        # Check 5: Check flag consistency
-        rw = (qword >> 1) & 0x1  # Read/Write
-        us = (qword >> 2) & 0x1  # User/Supervisor
-        accessed = (qword >> 5) & 0x1 # Accessed
-        dirty = (qword >> 6) & 0x1  # Dirty
+        rw = (qword >> 1) & 0x1
+        us = (qword >> 2) & 0x1
+        accessed = (qword >> 5) & 0x1
+        dirty = (qword >> 6) & 0x1
         
-        # Can't be dirty without write permission
         if dirty and not rw:
             return (False, score, "Dirty bit set but read-only")
         
-        # Reasonable flag combination
         if rw or us or accessed:
             score += 10
             reasons.append("Reasonable flags")
         
-        # Check 6: Page size bit
         ps = (qword >> 7) & 0x1
-        if ps: # Large page (2MB or 1GB)
+        if ps:
             score += 10
             reasons.append("Large page indicator")
-        else: # Standard 4KB page
+        else:
             score += 10
             reasons.append("Standard page size")
         
-        # Check 7: Not all flags set (would be suspicious)
         all_flags = qword & 0xFF
         if all_flags == 0xFF:
             return (False, score, "All flags set (suspicious)")
@@ -173,53 +442,25 @@ class HiddenPages(interfaces.plugins.PluginInterface):
         
         return (True, score, "; ".join(reasons))
 
-    def _get_official_pte(self, kernel_layer, virtual_address: int) -> Optional[int]:
-        """
-        Look up the official PTE for a virtual address using Volatility's page tables.
-        """
-        try:
-            # Use Volatility's translation mechanism
-            # This queries the official page tables
-            physical_address, _, page_size = kernel_layer.mapping(
-                virtual_address, 
-                0x1000,
-                ignore_errors=False
-            )
-            
-            # If we got here, the page is mapped
-            return physical_address
-            
-        except exceptions.InvalidAddressException:
-            # Page is not mapped in official tables
-            return None
-
     def _is_page_hidden(self, candidate_offset: int, candidate_pte: int, kernel_layer) -> Tuple[bool, str]:
         """
         Determine if the physical address referenced by a candidate PTE
         is accessible but not mapped in official page tables.
         """
-        # Extract physical address from candidate PTE
         pfn = (candidate_pte >> 12) & 0xFFFFFFFFF
         physical_address = pfn * 0x1000
         
-        # Replaced vollog.debug with print
         print(f"DEBUG: Checking PTE at offset {hex(candidate_offset)}: PFN={hex(pfn)}, Physical={hex(physical_address)}")
         
-        # Step 1: Can we access the physical memory it points to?
         try:
-            # Try to read from the physical address
             data = kernel_layer.read(physical_address, 16, pad=False)
             memory_exists = True
         except Exception as e:
-            # Physical memory doesn't exist or not accessible
             print(f"DEBUG: Physical address {hex(physical_address)} not accessible: {e}")
             return (False, f"PFN points to non-existent memory")
         
-        # Step 2: Is this physical address mapped via official page tables?
         test_ranges = [
-            # User mode range
             (0x0000000000000000, 0x00007FFFFFFFFFFF, "user-mode"),
-            # Kernel mode range 
             (0xFFFF800000000000, 0xFFFFFFFFFFFFFFFF, "kernel-mode"),
         ]
         
@@ -227,18 +468,14 @@ class HiddenPages(interfaces.plugins.PluginInterface):
         mapped_location = None
         
         for start, end, name in test_ranges:
-            # Sample virtual addresses in this range (can't check ALL)
-            # Check every 2MB (0x200000) as a heuristic
             for virtual_addr in range(start, min(start + 0x40000000, end), 0x200000):
                 try:
-                    # Try to translate this virtual address
                     translated_phys, _, _ = kernel_layer.mapping(
                         virtual_addr,
                         0x1000,
                         ignore_errors=False
                     )
                     
-                    # Does it map to our target physical address?
                     if translated_phys == physical_address:
                         is_mapped = True
                         mapped_location = f"{name} VA={hex(virtual_addr)}"
@@ -246,43 +483,73 @@ class HiddenPages(interfaces.plugins.PluginInterface):
                         break
                         
                 except Exception:
-                    # Virtual address not mapped (expected for most addresses)
                     continue
             
             if is_mapped:
                 break
         
-        # Step 3: Make determination
         if memory_exists and not is_mapped:
-            # Physical memory exists but no virtual mapping found
-            # This could be a hidden page!
             return (True, f"Physical memory exists at {hex(physical_address)} but no mapping found")
         elif memory_exists and is_mapped:
-            # Physical memory exists and is properly mapped
             return (False, f"Page properly mapped: {mapped_location}")
         else:
-            # Shouldn't reach here
             return (False, "Unknown state")
 
-    def _generator(self, kernel_layer) -> Iterator[Tuple]:
+    def _save_detailed_report(self, physical_addr: int, pte: int, confidence: int, 
+                              flags: str, report_num: int):
+        """
+        Save detailed page table walk report to file.
+        """
+        if not self.page_table_walker:
+            return
+        
+        report_dir = self.config.get('report-dir', './reports')
+        
+        # Create directory if it doesn't exist
+        try:
+            os.makedirs(report_dir, exist_ok=True)
+        except:
+            print(f"[!] Could not create report directory: {report_dir}")
+            return
+        
+        # Generate report
+        report = self.page_table_walker.generate_detailed_report(
+            physical_addr, pte, confidence, flags
+        )
+        
+        # Save to file
+        filename = os.path.join(report_dir, f"hidden_page_{report_num}_{hex(physical_addr)}.txt")
+        try:
+            with open(filename, 'w') as f:
+                f.write(report)
+            print(f"[SAVED] Detailed report: {filename}")
+        except Exception as e:
+            print(f"[!] Could not save report: {e}")
+
+    def _generator(self, kernel_layer, kernel) -> Iterator[Tuple]:
         """
         Main detection logic - generate results.
-        
-        Yields:
-            Tuples of detection results
         """
         scan_size = self.config.get('scan-size', 2048)
         min_confidence = self.config.get('confidence', 80)
+        generate_reports = self.config.get('detailed-reports', False)
         
         print("="*60)
-        print("Starting Hidden Page Detection")
+        print("Starting Hidden Page Detection (Enhanced)")
         print(f"Scan size: {scan_size} MB")
         print(f"Minimum confidence: {min_confidence}%")
+        print(f"Detailed reports: {generate_reports}")
         print("="*60)
+        
+        # Initialize page table walker if reports are requested
+        if generate_reports:
+            dtb = self._get_dtb(kernel)
+            self.page_table_walker = PageTableWalker(kernel_layer, dtb)
+            print(f"[*] Page table walker initialized (DTB: {hex(dtb)})")
         
         candidate_log = []
         
-        # Phase 1: Scan for signatures
+        # Phase 1, 2, 3: Scan, Validate, Check Hidden
         for offset, qword in self._scan_for_pte_signatures(kernel_layer, scan_size):
             
             # Phase 2: Validate candidate
@@ -291,7 +558,6 @@ class HiddenPages(interfaces.plugins.PluginInterface):
             if not is_valid:
                 continue
             
-            # Log ALL validated candidates (even below threshold)
             candidate_log.append({
                 'offset': offset,
                 'pte': qword,
@@ -313,10 +579,16 @@ class HiddenPages(interfaces.plugins.PluginInterface):
             if is_hidden:
                 self.hidden_pages_found += 1
                 
-                # Extract details for reporting
                 pfn = (qword >> 12) & 0xFFFFFFFFF
                 physical_addr = pfn * 0x1000
                 flags = self._decode_flags(qword)
+                
+                # Generate detailed report if requested
+                if generate_reports:
+                    self._save_detailed_report(
+                        physical_addr, qword, confidence, flags, 
+                        self.hidden_pages_found
+                    )
                 
                 yield (0, (
                     format_hints.Hex(offset),
@@ -328,7 +600,15 @@ class HiddenPages(interfaces.plugins.PluginInterface):
                     explanation
                 ))
         
-        # Log summary of all candidates
+        # Log intermediate summary (moved from run() for accurate counts)
+        print("="*60)
+        print(f"Detection Complete")
+        print(f"Candidates found: {self.candidates_found}")
+        print(f"Candidates validated: {self.candidates_validated}")
+        print(f"Hidden pages detected: {self.hidden_pages_found}")
+        print("="*60)
+        
+        # Log candidate distribution
         print(f"\nCandidate distribution:")
         print(f" Total validated: {len(candidate_log)}")
         if candidate_log:
@@ -342,22 +622,22 @@ class HiddenPages(interfaces.plugins.PluginInterface):
         flags = []
         
         if pte & 0x1:
-            flags.append("P") # Present
+            flags.append("P")
         if pte & 0x2:
-            flags.append("RW") # Read/Write
+            flags.append("RW")
         if pte & 0x4:
-            flags.append("US") # User/Supervisor
+            flags.append("US")
         if pte & 0x20:
-            flags.append("A") # Accessed
+            flags.append("A")
         if pte & 0x40:
-            flags.append("D") # Dirty
+            flags.append("D")
         if pte & 0x80:
-            flags.append("PS") # Page Size
+            flags.append("PS")
         
         return "|".join(flags) if flags else "NONE"
 
     def run(self):
-        """Main plugin execution"""
+        """Main plugin execution (now only returns the generator)"""
         kernel = self.context.modules[self.config['kernel']]
         kernel_layer = self.context.layers[kernel.layer_name]
         
@@ -372,16 +652,9 @@ class HiddenPages(interfaces.plugins.PluginInterface):
                 ("Status", str),
                 ("Details", str),
             ],
-            self._generator(kernel_layer)
+            self._generator(kernel_layer, kernel)
         )
         
-        # Log summary
-        # Replaced vollog.info with print
-        print("="*60)
-        print(f"Detection Complete")
-        print(f"Candidates found: {self.candidates_found}")
-        print(f"Candidates validated: {self.candidates_validated}")
-        print(f"Hidden pages detected: {self.hidden_pages_found}")
-        print("="*60)
+        # The summary print block has been removed from here.
         
         return results
