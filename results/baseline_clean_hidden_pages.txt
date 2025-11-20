@@ -1,0 +1,4 @@
+Volatility 3 Framework 2.27.0
+
+Offset	Physical Addr	PTE Value	Confidence	Flags	Status	Details
+
